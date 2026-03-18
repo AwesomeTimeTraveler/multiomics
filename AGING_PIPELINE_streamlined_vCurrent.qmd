@@ -1,0 +1,693 @@
+---
+title: "AGING PIPELINE vCurrent"
+format: html
+editor: visual
+---
+
+## Overview
+
+This streamlined Quarto file keeps one canonical implementation of each major module:
+
+1. configuration and helpers  
+2. ortholog preprocessing and annotation  
+3. QC and VST generation  
+4. DESeq2 results extraction  
+5. master gene-program classification  
+6. divergent and stable analyses  
+7. enrichment  
+8. decoupleR TF activity  
+9. WGCNA  
+10. publication figures and secretome overlays  
+
+It also adds a **secreted-gene annotation layer** to the master table and fixes the decoupleR output handling so inferred activity uses the numeric score.
+
+```{r}
+# ---- package load ----
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(apeglm)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(EnhancedVolcano)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(ReactomePA)
+  library(msigdbr)
+  library(WGCNA)
+  library(dynamicTreeCut)
+  library(flashClust)
+  library(matrixStats)
+  library(decoupleR)
+  library(fgsea)
+  library(igraph)
+  library(ggraph)
+})
+
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+```
+
+## 0. Config and helpers
+
+```{r}
+# ---- directories ----
+project_dir <- "C:/Users/theaw/Dropbox/PhD/Papers/Aging/rnaseq_publication_pipeline"
+dir.create(project_dir, showWarnings = FALSE, recursive = TRUE)
+
+subdirs <- c(
+  "input", "rds", "tables", "plots", "plots/qc", "plots/de", "plots/heatmaps",
+  "plots/enrichment", "plots/decoupler", "plots/wgcna", "plots/final", "objects"
+)
+walk(file.path(project_dir, subdirs), dir.create, showWarnings = FALSE, recursive = TRUE)
+
+paths <- list(
+  dds_acomys = file.path(project_dir, "input/dds_acomys.rds"),
+  dds_mus    = file.path(project_dir, "input/dds_mus.rds"),
+  dds_dual   = file.path(project_dir, "input/dds_dual_ortholog.rds"),
+  ortholog_map = file.path(project_dir, "input/ortholog_map.rds"),
+  annot_rds  = file.path(project_dir, "rds/ortholog_annotation.rds"),
+  secreted_csv = file.path(project_dir, "input/secreted_genes_mouse.csv"),
+  out        = project_dir
+)
+
+# ---- thresholds ----
+padj_cutoff <- 0.05
+lfc_cutoff <- 1
+stable_padj_cutoff <- 0.05
+stable_var_quantile <- 0.35
+n_top_heatmap <- 200
+
+# ---- factor levels ----
+age_levels <- c("embryonic", "young", "old")
+species_levels <- c("Acomys dimidiatus", "Mus musculus")
+species_short_levels <- c("Acomys", "Mus")
+
+# ---- generic helpers ----
+theme_pub <- function(base_size = 12) {
+  theme_bw(base_size = base_size) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "white", colour = "black"),
+      axis.line = element_line(colour = "black"),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.key = element_blank()
+    )
+}
+
+save_plot_dual <- function(plot_obj, filename, width = 8, height = 6, dpi = 300) {
+  ggsave(filename, plot_obj, width = width, height = height, dpi = dpi)
+  svg_name <- sub("\\.[A-Za-z]+$", ".svg", filename)
+  ggsave(svg_name, plot_obj, width = width, height = height)
+}
+
+normalize_age <- function(x) {
+  x <- as.character(x)
+  recode(x, "Embryonic" = "embryonic", "Young" = "young", "Old" = "old", .default = x)
+}
+
+normalize_species <- function(x) {
+  x <- as.character(x)
+  recode(x,
+    "Acomys dimidiatus" = "Acomys dimidiatus",
+    "Mus musculus" = "Mus musculus",
+    "Acomys" = "Acomys dimidiatus",
+    "Mus" = "Mus musculus",
+    .default = x
+  )
+}
+
+normalize_species_short <- function(x) {
+  x <- as.character(x)
+  recode(x,
+    "Acomys dimidiatus" = "Acomys",
+    "Mus musculus" = "Mus",
+    .default = x
+  )
+}
+
+extract_mus_id <- function(x) stringr::str_extract(as.character(x), "ENSMUSG[0-9]+")
+extract_aco_id <- function(x) stringr::str_extract(as.character(x), "ENSADMG[0-9]+")
+extract_first_id <- function(x) stringr::str_extract(as.character(x), "[A-Z]+[A-Z0-9]+G[0-9]+")
+
+safe_read_csv <- function(path) if (file.exists(path)) read.csv(path, check.names = FALSE) else NULL
+safe_read_rds <- function(path) if (file.exists(path)) readRDS(path) else NULL
+
+add_symbol_column <- function(df, annot = NULL, gene_col = "gene_id") {
+  if (is.null(annot)) {
+    if (!"Symbol" %in% colnames(df)) df$Symbol <- df[[gene_col]]
+    return(df)
+  }
+  out <- df %>% left_join(annot, by = setNames("gene_id", gene_col))
+  if (!"Symbol" %in% colnames(out)) out$Symbol <- out[[gene_col]]
+  out$Symbol[is.na(out$Symbol) | out$Symbol == ""] <- out[[gene_col]][is.na(out$Symbol) | out$Symbol == ""]
+  out
+}
+
+make_results_df <- function(res, label, annot = NULL, gene_col = "gene_id") {
+  as.data.frame(res) %>%
+    rownames_to_column(gene_col) %>%
+    mutate(result_name = label) %>%
+    add_symbol_column(annot = annot, gene_col = gene_col)
+}
+
+get_group_means <- function(vsd, group_col) {
+  mat <- assay(vsd)
+  meta <- as.data.frame(colData(vsd))
+  groups <- unique(meta[[group_col]])
+  out <- sapply(groups, function(g) rowMeans(mat[, meta[[group_col]] == g, drop = FALSE], na.rm = TRUE))
+  as.data.frame(out)
+}
+
+pattern_call <- function(e, y, o, tol = 0.25) {
+  vals <- c(e, y, o)
+  if (all(is.na(vals))) return(NA_character_)
+  if ((max(vals, na.rm = TRUE) - min(vals, na.rm = TRUE)) < tol) return("stable")
+  if (e < y && y < o) return("monotonic_up")
+  if (e > y && y > o) return("monotonic_down")
+  if (y > e && y > o) return("peak")
+  if (y < e && y < o) return("trough")
+  "mixed"
+}
+
+get_species_group_means_vars <- function(vsd, id_type = c("aco", "mus")) {
+  id_type <- match.arg(id_type)
+  mat <- assay(vsd)
+  meta <- as.data.frame(colData(vsd))
+  meta$ageGroup <- factor(normalize_age(meta$ageGroup), levels = age_levels)
+
+  means <- sapply(age_levels, function(g) {
+    rowMeans(mat[, meta$ageGroup == g, drop = FALSE], na.rm = TRUE)
+  }) %>% as.data.frame()
+
+  vars <- apply(means, 1, var, na.rm = TRUE)
+
+  out <- means %>%
+    rownames_to_column("raw_gene_id") %>%
+    mutate(var_age = vars)
+
+  if (id_type == "aco") {
+    out$acomys_gene_id <- coalesce(extract_aco_id(out$raw_gene_id), extract_first_id(out$raw_gene_id))
+  } else {
+    out$mus_gene_id <- coalesce(extract_mus_id(out$raw_gene_id), extract_first_id(out$raw_gene_id))
+  }
+
+  out
+}
+```
+
+## 1. Load DESeq2 objects
+
+```{r}
+dds_acomys <- readRDS(paths$dds_acomys)
+dds_mus    <- readRDS(paths$dds_mus)
+dds_dual   <- readRDS(paths$dds_dual)
+
+colData(dds_acomys)$ageGroup <- factor(normalize_age(colData(dds_acomys)$ageGroup), levels = age_levels)
+colData(dds_mus)$ageGroup    <- factor(normalize_age(colData(dds_mus)$ageGroup), levels = age_levels)
+colData(dds_dual)$ageGroup   <- factor(normalize_age(colData(dds_dual)$ageGroup), levels = age_levels)
+
+if ("species" %in% colnames(colData(dds_dual))) {
+  colData(dds_dual)$species <- factor(normalize_species(colData(dds_dual)$species), levels = species_levels)
+}
+if ("species_model" %in% colnames(colData(dds_dual))) {
+  colData(dds_dual)$species_model <- factor(normalize_species_short(colData(dds_dual)$species_model),
+                                           levels = species_short_levels)
+}
+```
+
+## 2. Ortholog preprocessing and annotation
+
+```{r}
+ortholog_map <- readRDS(paths$ortholog_map)
+
+ortholog_annot <- ortholog_map %>%
+  rename(
+    acomys_gene_id_raw = 1,
+    mus_gene_id_raw = 2
+  ) %>%
+  mutate(
+    acomys_gene_id = sub("\\..*$", "", acomys_gene_id_raw),
+    mus_gene_id = sub("\\..*$", "", mus_gene_id_raw),
+    gene_id = mus_gene_id
+  ) %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+mus_ids <- ortholog_annot$mus_gene_id
+
+ortholog_annot <- ortholog_annot %>%
+  mutate(
+    Symbol = mapIds(org.Mm.eg.db, keys = mus_ids, keytype = "ENSEMBL",
+                    column = "SYMBOL", multiVals = "first") |> unname(),
+    description = mapIds(org.Mm.eg.db, keys = mus_ids, keytype = "ENSEMBL",
+                         column = "GENENAME", multiVals = "first") |> unname(),
+    entrez = mapIds(org.Mm.eg.db, keys = mus_ids, keytype = "ENSEMBL",
+                    column = "ENTREZID", multiVals = "first") |> unname()
+  )
+
+saveRDS(ortholog_annot, paths$annot_rds)
+write.csv(ortholog_annot, file.path(paths$out, "tables/ortholog_annotation.csv"), row.names = FALSE)
+```
+
+## 3. QC and VST generation
+
+```{r}
+vsd_acomys <- vst(dds_acomys, blind = FALSE)
+vsd_mus    <- vst(dds_mus, blind = FALSE)
+vsd_dual   <- vst(dds_dual, blind = FALSE)
+
+saveRDS(vsd_acomys, file.path(paths$out, "rds/vsd_acomys.rds"))
+saveRDS(vsd_mus,    file.path(paths$out, "rds/vsd_mus.rds"))
+saveRDS(vsd_dual,   file.path(paths$out, "rds/vsd_dual.rds"))
+```
+
+## 4. DESeq2 model results
+
+```{r}
+# Run DESeq if needed before result extraction
+dds_acomys <- DESeq(dds_acomys, test = "Wald")
+dds_mus    <- DESeq(dds_mus, test = "Wald")
+dds_dual_wald <- DESeq(dds_dual, test = "Wald")
+
+dds_acomys_lrt <- DESeq(dds_acomys, test = "LRT", reduced = ~ 1)
+dds_mus_lrt    <- DESeq(dds_mus, test = "LRT", reduced = ~ 1)
+dds_dual_lrt   <- DESeq(dds_dual, test = "LRT", reduced = ~ species_model + ageGroup)
+
+aco_res <- list(
+  old_vs_emb = results(dds_acomys, contrast = c("ageGroup", "old", "embryonic")),
+  young_vs_emb = results(dds_acomys, contrast = c("ageGroup", "young", "embryonic")),
+  old_vs_young = results(dds_acomys, contrast = c("ageGroup", "old", "young")),
+  lrt_age = results(dds_acomys_lrt)
+)
+
+mus_res <- list(
+  old_vs_emb = results(dds_mus, contrast = c("ageGroup", "old", "embryonic")),
+  young_vs_emb = results(dds_mus, contrast = c("ageGroup", "young", "embryonic")),
+  old_vs_young = results(dds_mus, contrast = c("ageGroup", "old", "young")),
+  lrt_age = results(dds_mus_lrt)
+)
+
+dual_res <- list(
+  interaction_lrt = results(dds_dual_lrt)
+)
+
+aco_res$old_vs_emb_shr <- lfcShrink(dds_acomys, contrast = c("ageGroup", "old", "embryonic"),
+                                    res = aco_res$old_vs_emb, type = "apeglm")
+mus_res$old_vs_emb_shr <- lfcShrink(dds_mus, contrast = c("ageGroup", "old", "embryonic"),
+                                    res = mus_res$old_vs_emb, type = "apeglm")
+```
+
+## 5. Build master gene classification table
+
+```{r}
+aco_oe <- aco_res$old_vs_emb_shr %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  mutate(acomys_gene_id = coalesce(extract_aco_id(gene_id), extract_first_id(gene_id))) %>%
+  select(acomys_gene_id, aco_log2FC = log2FoldChange, aco_padj = padj, aco_pvalue = pvalue) %>%
+  distinct(acomys_gene_id, .keep_all = TRUE)
+
+mus_oe <- mus_res$old_vs_emb_shr %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  mutate(mus_gene_id = coalesce(extract_mus_id(gene_id), extract_first_id(gene_id))) %>%
+  select(mus_gene_id, mus_log2FC = log2FoldChange, mus_padj = padj, mus_pvalue = pvalue) %>%
+  distinct(mus_gene_id, .keep_all = TRUE)
+
+int_df <- dual_res$interaction_lrt %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  mutate(
+    mus_gene_id = extract_mus_id(gene_id),
+    acomys_gene_id = extract_aco_id(gene_id)
+  ) %>%
+  select(gene_id, mus_gene_id, acomys_gene_id, int_padj = padj, int_pvalue = pvalue, int_stat = stat) %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+aco_means <- get_species_group_means_vars(vsd_acomys, id_type = "aco") %>%
+  select(acomys_gene_id, embryonic, young, old, var_age) %>%
+  rename(aco_emb = embryonic, aco_young = young, aco_old = old, var_acomys = var_age) %>%
+  distinct(acomys_gene_id, .keep_all = TRUE)
+
+mus_means <- get_species_group_means_vars(vsd_mus, id_type = "mus") %>%
+  select(mus_gene_id, embryonic, young, old, var_age) %>%
+  rename(mus_emb = embryonic, mus_young = young, mus_old = old, var_mus = var_age) %>%
+  distinct(mus_gene_id, .keep_all = TRUE)
+
+master <- ortholog_annot %>%
+  left_join(aco_oe, by = "acomys_gene_id") %>%
+  left_join(mus_oe, by = "mus_gene_id") %>%
+  left_join(int_df %>% select(gene_id, int_padj, int_pvalue, int_stat), by = "gene_id") %>%
+  left_join(aco_means, by = "acomys_gene_id") %>%
+  left_join(mus_means, by = "mus_gene_id") %>%
+  mutate(
+    pattern_acomys = purrr::pmap_chr(list(aco_emb, aco_young, aco_old), pattern_call),
+    pattern_mus = purrr::pmap_chr(list(mus_emb, mus_young, mus_old), pattern_call)
+  )
+
+aco_var_thresh <- quantile(master$var_acomys, probs = stable_var_quantile, na.rm = TRUE)
+mus_var_thresh <- quantile(master$var_mus, probs = stable_var_quantile, na.rm = TRUE)
+
+master <- master %>%
+  mutate(
+    sig_acomys = !is.na(aco_padj) & aco_padj < padj_cutoff & abs(aco_log2FC) >= lfc_cutoff,
+    sig_mus = !is.na(mus_padj) & mus_padj < padj_cutoff & abs(mus_log2FC) >= lfc_cutoff,
+    sig_interaction = !is.na(int_padj) & int_padj < padj_cutoff,
+    stable_acomys = (is.na(aco_padj) | aco_padj >= stable_padj_cutoff) & !is.na(var_acomys) & var_acomys <= aco_var_thresh,
+    stable_mus = (is.na(mus_padj) | mus_padj >= stable_padj_cutoff) & !is.na(var_mus) & var_mus <= mus_var_thresh,
+    adult_distance_acomys = abs(aco_old - aco_emb),
+    adult_distance_mus = abs(mus_old - mus_emb),
+    acomys_embryonic_retained = adult_distance_acomys < adult_distance_mus,
+    class_main = case_when(
+      sig_interaction ~ "divergent_trajectory",
+      sig_acomys & sig_mus ~ "shared_age_responsive",
+      sig_acomys & !sig_mus ~ "acomys_specific_age_responsive",
+      !sig_acomys & sig_mus ~ "mus_specific_age_responsive",
+      stable_acomys & stable_mus ~ "shared_stable",
+      stable_acomys & sig_mus ~ "acomys_uniquely_stable",
+      sig_acomys & stable_mus ~ "mus_uniquely_stable_reference",
+      TRUE ~ "other"
+    ),
+    class_sub = case_when(
+      class_main == "acomys_uniquely_stable" & acomys_embryonic_retained ~ "acomys_stable_embryonic_like",
+      pattern_acomys == pattern_mus ~ paste0("matched_", pattern_acomys),
+      TRUE ~ paste(pattern_acomys, pattern_mus, sep = "__")
+    )
+  )
+```
+
+## 6. Add secretome annotation layer
+
+```{r}
+secreted_tbl <- safe_read_csv(paths$secreted_csv)
+
+if (!is.null(secreted_tbl)) {
+  # Expected input: one of gene_id / mus_gene_id / Symbol
+  if (!"gene_id" %in% colnames(secreted_tbl) && "mus_gene_id" %in% colnames(secreted_tbl)) {
+    secreted_tbl$gene_id <- secreted_tbl$mus_gene_id
+  }
+
+  secreted_tbl <- secreted_tbl %>%
+    mutate(gene_id = as.character(gene_id)) %>%
+    filter(!is.na(gene_id), gene_id != "") %>%
+    distinct(gene_id, .keep_all = TRUE)
+
+  master <- master %>%
+    left_join(secreted_tbl %>% transmute(gene_id, is_secreted = TRUE), by = "gene_id") %>%
+    mutate(
+      is_secreted = coalesce(is_secreted, FALSE),
+      class_secretome = case_when(
+        is_secreted & class_main == "divergent_trajectory" ~ "secreted_divergent",
+        is_secreted & class_main == "shared_age_responsive" ~ "secreted_shared_age_responsive",
+        is_secreted & class_main == "acomys_specific_age_responsive" ~ "secreted_acomys_specific_age_responsive",
+        is_secreted & class_main == "mus_specific_age_responsive" ~ "secreted_mus_specific_age_responsive",
+        is_secreted & class_main == "shared_stable" ~ "secreted_shared_stable",
+        is_secreted & class_main == "acomys_uniquely_stable" ~ "secreted_acomys_uniquely_stable",
+        is_secreted & class_main == "mus_uniquely_stable_reference" ~ "secreted_mus_uniquely_stable_reference",
+        is_secreted ~ "secreted_other",
+        TRUE ~ "non_secreted"
+      )
+    )
+} else {
+  master <- master %>%
+    mutate(
+      is_secreted = FALSE,
+      class_secretome = "non_secreted"
+    )
+}
+
+write.csv(master, file.path(paths$out, "tables/gene_classification_master.csv"), row.names = FALSE)
+saveRDS(master, file.path(paths$out, "objects/gene_classification_master.rds"))
+```
+
+## 7. Divergent trajectory heatmap
+
+```{r}
+meta_dual <- as.data.frame(colData(vsd_dual))
+meta_dual$ageGroup <- factor(normalize_age(meta_dual$ageGroup), levels = age_levels)
+meta_dual$species_short <- factor(normalize_species_short(meta_dual$species), levels = species_short_levels)
+meta_dual$group <- factor(
+  paste(meta_dual$species_short, meta_dual$ageGroup, sep = "_"),
+  levels = c("Acomys_embryonic", "Acomys_young", "Acomys_old", "Mus_embryonic", "Mus_young", "Mus_old")
+)
+
+mat_dual <- assay(vsd_dual)
+
+group_means <- sapply(levels(meta_dual$group), function(g) {
+  rowMeans(mat_dual[, meta_dual$group == g, drop = FALSE], na.rm = TRUE)
+}) %>%
+  as.data.frame() %>%
+  rownames_to_column("raw_gene_id") %>%
+  mutate(
+    mus_gene_id = extract_mus_id(raw_gene_id),
+    gene_id = mus_gene_id
+  ) %>%
+  filter(!is.na(gene_id)) %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+plot_df <- master %>%
+  filter(class_main == "divergent_trajectory") %>%
+  select(gene_id, Symbol, class_main, class_sub, is_secreted, class_secretome) %>%
+  inner_join(group_means, by = "gene_id")
+
+heat_mat <- plot_df %>%
+  select(Acomys_embryonic, Acomys_young, Acomys_old, Mus_embryonic, Mus_young, Mus_old) %>%
+  as.matrix()
+rownames(heat_mat) <- plot_df$Symbol %||% plot_df$gene_id
+heat_mat <- t(scale(t(heat_mat)))
+
+pdf(file.path(paths$out, "plots/heatmaps/divergent_trajectory_heatmap.pdf"), width = 9, height = 10)
+Heatmap(
+  heat_mat,
+  name = "z-score",
+  show_row_names = FALSE,
+  cluster_columns = FALSE,
+  column_title = "Divergent trajectories"
+)
+dev.off()
+```
+
+## 8. Enrichment
+
+```{r}
+master2 <- master %>% filter(!is.na(entrez))
+
+run_go <- function(df, class_name, outfile_prefix) {
+  genes <- unique(na.omit(df$entrez[df$class_main == class_name | df$class_sub == class_name]))
+  if (length(genes) < 10) return(NULL)
+
+  ego <- enrichGO(
+    gene = genes,
+    OrgDb = org.Mm.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    readable = TRUE
+  )
+
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    write.csv(as.data.frame(ego), file.path(paths$out, paste0("tables/", outfile_prefix, "_GO.csv")), row.names = FALSE)
+    p <- dotplot(ego, showCategory = 20) + ggtitle(paste("GO BP:", class_name)) + theme_pub()
+    save_plot_dual(p, file.path(paths$out, paste0("plots/enrichment/", outfile_prefix, "_GO.png")), 9, 6)
+  }
+
+  er <- enrichPathway(gene = genes, organism = "mouse", pAdjustMethod = "BH", readable = TRUE)
+  if (!is.null(er) && nrow(as.data.frame(er)) > 0) {
+    write.csv(as.data.frame(er), file.path(paths$out, paste0("tables/", outfile_prefix, "_Reactome.csv")), row.names = FALSE)
+    p2 <- dotplot(er, showCategory = 20) + ggtitle(paste("Reactome:", class_name)) + theme_pub()
+    save_plot_dual(p2, file.path(paths$out, paste0("plots/enrichment/", outfile_prefix, "_Reactome.png")), 9, 6)
+  }
+}
+
+run_go(master2, "divergent_trajectory", "divergent_trajectory")
+run_go(master2, "acomys_specific_age_responsive", "acomys_specific_age_responsive")
+run_go(master2, "mus_specific_age_responsive", "mus_specific_age_responsive")
+run_go(master2, "acomys_stable_embryonic_like", "acomys_stable_embryonic_like")
+
+run_go(master2 %>% filter(is_secreted), "divergent_trajectory", "secreted_divergent_trajectory")
+run_go(master2 %>% filter(is_secreted), "acomys_specific_age_responsive", "secreted_acomys_specific_age_responsive")
+
+msig_h <- msigdbr(species = "Mus musculus", category = "H") %>% split(x = .$gene_symbol, f = .$gs_name)
+
+ranks <- master %>%
+  filter(!is.na(int_stat), !is.na(Symbol), Symbol != "") %>%
+  arrange(desc(int_stat)) %>%
+  select(Symbol, int_stat) %>%
+  distinct(Symbol, .keep_all = TRUE)
+
+rank_vec <- ranks$int_stat
+names(rank_vec) <- ranks$Symbol
+rank_vec <- sort(rank_vec, decreasing = TRUE)
+
+fg <- fgsea(pathways = msig_h, stats = rank_vec, minSize = 10, maxSize = 500)
+write.csv(fg, file.path(paths$out, "tables/fgsea_hallmark_interaction.csv"), row.names = FALSE)
+```
+
+## 9. TF activity with decoupleR
+
+```{r}
+expr <- assay(vsd_dual)
+rownames(expr) <- extract_mus_id(rownames(expr))
+
+expr <- as.data.frame(expr) %>%
+  rownames_to_column("gene_id") %>%
+  filter(!is.na(gene_id)) %>%
+  group_by(gene_id) %>%
+  summarise(across(-gene_id, ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+meta <- as.data.frame(colData(vsd_dual)) %>%
+  rownames_to_column("sample") %>%
+  mutate(
+    ageGroup = factor(normalize_age(ageGroup), levels = age_levels),
+    species_model = factor(normalize_species_short(species), levels = species_short_levels)
+  )
+
+if (exists("get_collectri")) {
+  network <- get_collectri(organism = "mouse", split_complexes = FALSE)
+
+  acts <- run_ulm(
+    mat = expr,
+    net = network,
+    .source = "source",
+    .target = "target",
+    .mor = "mor",
+    minsize = 5
+  )
+
+  # decoupleR returns score as the numeric inferred activity; statistic is the method label
+  acts_wide <- acts %>%
+    select(source, condition, score) %>%
+    pivot_wider(names_from = condition, values_from = score) %>%
+    column_to_rownames("source") %>%
+    as.matrix()
+
+  ann_col <- meta %>% select(species_model, ageGroup)
+  rownames(ann_col) <- meta$sample
+
+  pheatmap(
+    acts_wide,
+    scale = "row",
+    annotation_col = ann_col,
+    show_rownames = FALSE,
+    filename = file.path(paths$out, "plots/decoupler/tf_activity_heatmap.png"),
+    width = 10, height = 8
+  )
+
+  tf_long <- acts %>%
+    left_join(meta, by = c("condition" = "sample"))
+
+  tf_summary <- tf_long %>%
+    group_by(source, species_model, ageGroup) %>%
+    summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop")
+
+  top_tfs <- tf_summary %>%
+    group_by(source) %>%
+    summarise(sd_score = sd(mean_score, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(sd_score)) %>%
+    slice_head(n = 24) %>%
+    pull(source)
+
+  p <- tf_summary %>%
+    filter(source %in% top_tfs) %>%
+    ggplot(aes(ageGroup, mean_score, color = species_model, group = species_model)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ source, scales = "free_y") +
+    theme_pub() +
+    labs(title = "Top inferred TF activities", x = NULL, y = "ULM activity", color = "Species")
+
+  save_plot_dual(p, file.path(paths$out, "plots/decoupler/top_tf_activity_trajectories.png"), 12, 10)
+  write.csv(tf_long, file.path(paths$out, "tables/decoupler_tf_activity_long.csv"), row.names = FALSE)
+  saveRDS(acts, file.path(paths$out, "objects/decoupler_tf_activities.rds"))
+
+  # Optional separate TF transcript abundance layer
+  tf_ids <- unique(network$source)
+  tf_expr_summary <- master %>%
+    filter(Symbol %in% tf_ids | gene_id %in% tf_ids) %>%
+    select(gene_id, Symbol, class_main, class_sub, is_secreted,
+           aco_log2FC, aco_padj, mus_log2FC, mus_padj, int_padj, int_stat)
+  write.csv(tf_expr_summary, file.path(paths$out, "tables/tf_transcript_level_summary.csv"), row.names = FALSE)
+}
+```
+
+## 10. WGCNA
+
+```{r}
+expr0 <- assay(vsd_dual)
+meta <- as.data.frame(colData(vsd_dual))
+meta$species <- factor(normalize_species(meta$species), levels = species_levels)
+meta$ageGroup <- factor(normalize_age(meta$ageGroup), levels = age_levels)
+
+rownames(expr0) <- extract_mus_id(rownames(expr0))
+
+expr_wgcna <- as.data.frame(expr0) %>%
+  rownames_to_column("gene_id") %>%
+  filter(!is.na(gene_id)) %>%
+  group_by(gene_id) %>%
+  summarise(across(-gene_id, ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+var_keep <- rowVars(expr_wgcna) >= median(rowVars(expr_wgcna), na.rm = TRUE)
+expr_wgcna <- expr_wgcna[var_keep, , drop = FALSE]
+
+datExpr <- t(expr_wgcna)
+
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+powers <- c(1:10, seq(12, 30, by = 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed", verbose = 5)
+softPower <- ifelse(is.na(sft$powerEstimate), 12, sft$powerEstimate)
+
+adjacency_mat <- adjacency(datExpr, power = softPower, type = "signed")
+TOM <- TOMsimilarity(adjacency_mat, TOMType = "signed")
+dissTOM <- 1 - TOM
+
+geneTree <- flashClust(as.dist(dissTOM), method = "average")
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM, deepSplit = 2,
+                             pamRespectsDendro = FALSE, minClusterSize = 30)
+dynamicColors <- labels2colors(dynamicMods)
+
+MEList <- moduleEigengenes(datExpr, colors = dynamicColors)
+MEs <- orderMEs(MEList$eigengenes)
+
+module_df <- tibble(gene_id = colnames(datExpr), module = dynamicColors) %>%
+  left_join(master %>% select(gene_id, Symbol, class_main, class_sub, is_secreted, class_secretome),
+            by = "gene_id")
+
+write.csv(module_df, file.path(paths$out, "tables/wgcna_module_assignments.csv"), row.names = FALSE)
+saveRDS(module_df, file.path(paths$out, "objects/wgcna_module_assignments.rds"))
+```
+
+## 11. Secretome summaries
+
+```{r}
+secretome_summary <- master %>%
+  count(class_main, is_secreted, sort = TRUE)
+
+write.csv(secretome_summary, file.path(paths$out, "tables/secretome_class_summary.csv"), row.names = FALSE)
+
+secreted_candidates <- master %>%
+  filter(is_secreted) %>%
+  arrange(class_main, int_padj, desc(abs(int_stat))) %>%
+  select(gene_id, Symbol, class_main, class_sub, class_secretome,
+         aco_log2FC, aco_padj, mus_log2FC, mus_padj, int_stat, int_padj)
+
+write.csv(secreted_candidates, file.path(paths$out, "tables/secreted_candidate_table.csv"), row.names = FALSE)
+```
+
+## Notes
+
+- Keep only this file as the canonical current version.
+- Older V2/V3 chunks should be retired once their useful logic is merged here.
+- TF **activity** from decoupleR is not the same as TF **expression** or TF **binding**.
+- A separate TF-binding layer should only be added if you later provide motif-, ATAC-, ChIP-, or CUT&RUN-derived priors or occupancy data.
